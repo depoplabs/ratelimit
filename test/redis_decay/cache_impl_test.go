@@ -280,8 +280,12 @@ func TestMultipleDescriptorsIndependent(t *testing.T) {
 	assert.Equal(pb.RateLimitResponse_OK, statuses[1].Code)
 }
 
-// Redis being down fails open: requests are admitted, nothing panics.
-func TestRedisDownFailsOpen(t *testing.T) {
+// A Redis failure must surface as redis.RedisError, exactly as the fixed-window
+// backend does. The service layer recovers it into a gRPC error, increments the
+// RedisError stat, and Envoy's failure_mode_deny setting then decides whether
+// the request is admitted. Swallowing the error here would both hide the outage
+// from metrics and silently override an operator's fail-closed policy.
+func TestRedisDownSurfacesRedisError(t *testing.T) {
 	assert := assert.New(t)
 	rs := mustNewRedisServer()
 	controller := gomock.NewController(t)
@@ -299,10 +303,14 @@ func TestRedisDownFailsOpen(t *testing.T) {
 	request := common.NewRateLimitRequest("domain", [][][2]string{{{"key", "value"}}}, 1)
 	limits := []*config.RateLimit{config.NewRateLimit(10, pb.RateLimitResponse_RateLimit_MINUTE, sm.NewStats("key_value"), false, false, false, "", nil, false)}
 
-	assert.NotPanics(func() {
-		statuses := cache.DoLimit(context.Background(), request, limits)
-		assert.Equal(pb.RateLimitResponse_OK, statuses[0].Code)
-	})
+	defer func() {
+		r := recover()
+		assert.NotNil(r, "a Redis failure must panic so the service layer can classify it")
+		_, isRedisError := r.(redis.RedisError)
+		assert.True(isRedisError, "panic value must be redis.RedisError, got %T", r)
+	}()
+	cache.DoLimit(context.Background(), request, limits)
+	assert.Fail("DoLimit returned normally despite Redis being down")
 }
 
 // Envoy's hits_addend must be honored: one request can consume several hits.

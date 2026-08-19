@@ -11,7 +11,6 @@ import (
 	"strconv"
 
 	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
-	logger "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -105,8 +104,11 @@ func (this *decayRateLimitCacheImpl) DoLimit(
 
 	if pipeline != nil {
 		if err := this.client.PipeDo(ctx, pipeline); err != nil {
-			logger.Errorf("redis_decay pipeline error (failing open): %v", err)
-			return statuses
+			// Surface the failure exactly as the fixed-window backend does: the
+			// service layer recovers it, increments the RedisError stat, and the
+			// caller's configured failure-mode policy decides whether to admit.
+			// Returning OK here would hide the outage and override that policy.
+			panic(redis.RedisError(err.Error()))
 		}
 	}
 
