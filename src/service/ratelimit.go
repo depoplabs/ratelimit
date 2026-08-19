@@ -33,18 +33,10 @@ import (
 
 var tracer = otel.Tracer("ratelimit")
 
-// Soft-breach header threshold, 0 disables. Ratio semantics
-// match NEAR_LIMIT_RATIO (e.g. 0.7 = header once 70% of the budget is used).
-// Set from settings by the runner at startup via SetSoftBreachHeaderRatio.
-var softBreachHeaderRatio float64
-
-func SetSoftBreachHeaderRatio(ratio float64) {
-	if ratio > 0 && ratio < 1 {
-		softBreachHeaderRatio = ratio
-	} else {
-		softBreachHeaderRatio = 0
-	}
-}
+// Header added to the UPSTREAM request when an admitted request is above a
+// descriptor's soft_requests_per_unit threshold, so the backend can degrade
+// before clients start seeing 429s.
+const softBreachHeaderName = "x-ratelimit-soft-breached"
 
 type RateLimitServiceServer interface {
 	pb.RateLimitServiceServer
@@ -276,19 +268,24 @@ func (this *service) shouldRateLimitWorker(
 		}
 	}
 
-	// Client-visible soft-breach signal. When the request is admitted but
-	// any checked descriptor is inside the soft band
-	// (remaining <= (1-ratio)*limit), emit a response header so downstream
-	// can degrade gracefully before a hard 429.
-	if softBreachHeaderRatio > 0 && finalCode == pb.RateLimitResponse_OK {
+	// Soft-breach signal. When the request is admitted but a descriptor that
+	// configures soft_requests_per_unit is above that threshold, flag it to the
+	// UPSTREAM service so it can degrade before clients start seeing 429s.
+	// Only descriptors carrying a soft threshold participate; the rest can
+	// never soft-breach.
+	if finalCode == pb.RateLimitResponse_OK {
 		for i, status := range response.Statuses {
-			if isUnlimited[i] || status.CurrentLimit == nil {
+			if isUnlimited[i] || status.CurrentLimit == nil || limitsToCheck[i] == nil {
 				continue
 			}
-			softBand := float64(status.CurrentLimit.RequestsPerUnit) * (1 - softBreachHeaderRatio)
-			if float64(status.LimitRemaining) <= softBand {
-				response.ResponseHeadersToAdd = append(response.ResponseHeadersToAdd,
-					&core.HeaderValue{Key: "x-ratelimit-soft-breach", Value: "1"})
+			soft := limitsToCheck[i].SoftRequestsPerUnit
+			if soft == 0 {
+				continue
+			}
+			used := status.CurrentLimit.RequestsPerUnit - status.LimitRemaining
+			if used > soft {
+				response.RequestHeadersToAdd = append(response.RequestHeadersToAdd,
+					&core.HeaderValue{Key: softBreachHeaderName, Value: "1"})
 				break
 			}
 		}

@@ -196,7 +196,6 @@ func (runner *Runner) Run() {
 		}
 	}()
 
-	ratelimit.SetSoftBreachHeaderRatio(s.SoftBreachHeaderRatio)
 	service := ratelimit.NewService(
 		limiter,
 		srv.Provider(),
