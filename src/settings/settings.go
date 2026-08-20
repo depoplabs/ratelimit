@@ -113,6 +113,9 @@ type Settings struct {
 
 	// Settings for optional returning of custom headers
 	RateLimitResponseHeadersEnabled bool `envconfig:"LIMIT_RESPONSE_HEADERS_ENABLED" default:"false"`
+	// RetryAfterHeaderEnabled adds a standard Retry-After header on a hard
+	// breach, set to the breaching descriptor's period in seconds.
+	RetryAfterHeaderEnabled bool `envconfig:"RETRY_AFTER_HEADER_ENABLED" default:"false"`
 	// value: the current limit
 	HeaderRatelimitLimit string `envconfig:"LIMIT_LIMIT_HEADER" default:"RateLimit-Limit"`
 	// value: remaining count

@@ -38,6 +38,9 @@ var tracer = otel.Tracer("ratelimit")
 // before clients start seeing 429s.
 const softBreachHeaderName = "x-ratelimit-soft-breached"
 
+// Standard back-off header returned to the client on a hard breach.
+const retryAfterHeaderName = "retry-after"
+
 type RateLimitServiceServer interface {
 	pb.RateLimitServiceServer
 	GetCurrentConfig() (config.RateLimitConfig, bool, bool)
@@ -52,6 +55,7 @@ type service struct {
 	stats                          stats.ServiceStats
 	health                         *server.HealthChecker
 	customHeadersEnabled           bool
+	retryAfterEnabled              bool
 	customHeaderLimitHeader        string
 	customHeaderRemainingHeader    string
 	customHeaderResetHeader        string
@@ -95,6 +99,7 @@ func (this *service) SetConfig(updateEvent provider.ConfigUpdateEvent, healthyWi
 	this.globalShadowMode = rlSettings.GlobalShadowMode
 	this.globalQuotaMode = rlSettings.GlobalQuotaMode
 	this.responseDynamicMetadataEnabled = rlSettings.ResponseDynamicMetadata
+	this.retryAfterEnabled = rlSettings.RetryAfterHeaderEnabled
 
 	if rlSettings.RateLimitResponseHeadersEnabled {
 		this.customHeadersEnabled = true
@@ -295,6 +300,27 @@ func (this *service) shouldRateLimitWorker(
 	if finalCode == pb.RateLimitResponse_OVER_LIMIT && globalShadowMode {
 		finalCode = pb.RateLimitResponse_OK
 		this.stats.GlobalShadowMode.Inc()
+	}
+
+	// Retry-After on a hard breach, carrying the breaching descriptor's own
+	// period in seconds. Placed after the global shadow-mode conversion above:
+	// a shadowed breach is admitted, so telling the client to back off would be
+	// wrong. Opt-in, so existing deployments see no response-shape change.
+	if this.retryAfterEnabled && finalCode == pb.RateLimitResponse_OVER_LIMIT {
+		for i, status := range response.Statuses {
+			if status.Code != pb.RateLimitResponse_OVER_LIMIT || status.CurrentLimit == nil {
+				continue
+			}
+			if limitsToCheck[i] != nil && limitsToCheck[i].ShadowMode {
+				continue
+			}
+			response.ResponseHeadersToAdd = append(response.ResponseHeadersToAdd,
+				&core.HeaderValue{
+					Key:   retryAfterHeaderName,
+					Value: strconv.FormatInt(utils.UnitToDivider(status.CurrentLimit.Unit), 10),
+				})
+			break
+		}
 	}
 
 	// If response dynamic data enabled, set dynamic data on response.
