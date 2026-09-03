@@ -33,6 +33,14 @@ import (
 
 var tracer = otel.Tracer("ratelimit")
 
+// Header added to the UPSTREAM request when an admitted request is above a
+// descriptor's soft_requests_per_unit threshold, so the backend can degrade
+// before clients start seeing 429s.
+const softBreachHeaderName = "x-ratelimit-soft-breached"
+
+// Standard back-off header returned to the client on a hard breach.
+const retryAfterHeaderName = "retry-after"
+
 type RateLimitServiceServer interface {
 	pb.RateLimitServiceServer
 	GetCurrentConfig() (config.RateLimitConfig, bool, bool)
@@ -47,6 +55,7 @@ type service struct {
 	stats                          stats.ServiceStats
 	health                         *server.HealthChecker
 	customHeadersEnabled           bool
+	retryAfterEnabled              bool
 	customHeaderLimitHeader        string
 	customHeaderRemainingHeader    string
 	customHeaderResetHeader        string
@@ -90,6 +99,7 @@ func (this *service) SetConfig(updateEvent provider.ConfigUpdateEvent, healthyWi
 	this.globalShadowMode = rlSettings.GlobalShadowMode
 	this.globalQuotaMode = rlSettings.GlobalQuotaMode
 	this.responseDynamicMetadataEnabled = rlSettings.ResponseDynamicMetadata
+	this.retryAfterEnabled = rlSettings.RetryAfterHeaderEnabled
 
 	if rlSettings.RateLimitResponseHeadersEnabled {
 		this.customHeadersEnabled = true
@@ -263,10 +273,54 @@ func (this *service) shouldRateLimitWorker(
 		}
 	}
 
+	// Soft-breach signal. When the request is admitted but a descriptor that
+	// configures soft_requests_per_unit is above that threshold, flag it to the
+	// UPSTREAM service so it can degrade before clients start seeing 429s.
+	// Only descriptors carrying a soft threshold participate; the rest can
+	// never soft-breach.
+	if finalCode == pb.RateLimitResponse_OK {
+		for i, status := range response.Statuses {
+			if isUnlimited[i] || status.CurrentLimit == nil || limitsToCheck[i] == nil {
+				continue
+			}
+			soft := limitsToCheck[i].SoftRequestsPerUnit
+			if soft == 0 {
+				continue
+			}
+			used := status.CurrentLimit.RequestsPerUnit - status.LimitRemaining
+			if used > soft {
+				response.RequestHeadersToAdd = append(response.RequestHeadersToAdd,
+					&core.HeaderValue{Key: softBreachHeaderName, Value: "1"})
+				break
+			}
+		}
+	}
+
 	// If there is a global shadow_mode, it should always return OK
 	if finalCode == pb.RateLimitResponse_OVER_LIMIT && globalShadowMode {
 		finalCode = pb.RateLimitResponse_OK
 		this.stats.GlobalShadowMode.Inc()
+	}
+
+	// Retry-After on a hard breach, carrying the breaching descriptor's own
+	// period in seconds. Placed after the global shadow-mode conversion above:
+	// a shadowed breach is admitted, so telling the client to back off would be
+	// wrong. Opt-in, so existing deployments see no response-shape change.
+	if this.retryAfterEnabled && finalCode == pb.RateLimitResponse_OVER_LIMIT {
+		for i, status := range response.Statuses {
+			if status.Code != pb.RateLimitResponse_OVER_LIMIT || status.CurrentLimit == nil {
+				continue
+			}
+			if limitsToCheck[i] != nil && limitsToCheck[i].ShadowMode {
+				continue
+			}
+			response.ResponseHeadersToAdd = append(response.ResponseHeadersToAdd,
+				&core.HeaderValue{
+					Key:   retryAfterHeaderName,
+					Value: strconv.FormatInt(utils.UnitToDivider(status.CurrentLimit.Unit), 10),
+				})
+			break
+		}
 	}
 
 	// If response dynamic data enabled, set dynamic data on response.
