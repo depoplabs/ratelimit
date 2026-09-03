@@ -70,6 +70,13 @@ func NewFromSettings(ctx context.Context, s settings.Settings, srv server.Server
 	return NewDecayRateLimitCacheImpl(client, timeSource, s.CacheKeyPrefix), client
 }
 
+// allowlistKeys names the descriptor-entry keys PLA-8129 lets an operator
+// exempt at runtime, one Redis SET per key: SADD allowlist:<name> <value>
+// takes effect on the very next request — no deploy, no EnvoyFilter apply.
+// This replaces the compiled-in Lua tables (IP_ALLOWLIST / USER_ID_ALLOWLIST)
+// that were the PLA-8129 gap: a config change was still a deploy.
+var allowlistKeys = map[string]bool{"rl_ip": true, "rl_ua": true, "rl_subject": true}
+
 func (this *decayRateLimitCacheImpl) DoLimit(
 	ctx context.Context,
 	request *pb.RateLimitRequest,
@@ -77,14 +84,79 @@ func (this *decayRateLimitCacheImpl) DoLimit(
 ) []*pb.RateLimitResponse_DescriptorStatus {
 	statuses := make([]*pb.RateLimitResponse_DescriptorStatus, len(request.Descriptors))
 	results := make([]uint64, len(request.Descriptors))
-	var pipeline redis.Pipeline
+	allowlisted := make([]bool, len(request.Descriptors))
 
 	nowMs := this.timeSource.UnixNow() * 1000
 	hitsAddends := utils.GetHitsAddends(request)
 
+	// Phase 1: one round trip checking every allowlist-eligible VALUE seen
+	// anywhere in the request against its own live Redis SET. Runs before any
+	// decay counter is touched, so an allowlisted caller never increments a
+	// bucket it will be exempted from.
+	//
+	// The three allowlists are NOT symmetric — matching ratelimiting.lua
+	// exactly (ip_rate_limit_with_pooling / user_agent_rate_limit_with_pooling
+	// / auth_rate_limit_with_pooling, :204-253):
+	//   - an allowlisted IP exempts ip, ua AND subject together
+	//   - an allowlisted user-agent or user-id exempts only its own bucket
+	//   - client_id is never exempted by any allowlist
+	// A per-descriptor-only check (allowlist this descriptor iff its own key
+	// is allowlisted) reproduces the second and third rules but silently
+	// drops the first — the cross-bucket IP exemption is a request-level
+	// correlation, not a per-descriptor one. So this collects each key's
+	// VALUE from wherever it appears in the request first, then applies the
+	// exemption rule per descriptor type afterward.
+	values := map[string]string{}
+	for i, descriptor := range request.Descriptors {
+		if limits[i] == nil {
+			continue
+		}
+		for _, entry := range descriptor.Entries {
+			if allowlistKeys[entry.Key] {
+				values[entry.Key] = entry.Value
+			}
+		}
+	}
+	membership := map[string]*uint64{}
+	var checkPipeline redis.Pipeline
+	for key, value := range values {
+		var res uint64
+		membership[key] = &res
+		if checkPipeline == nil {
+			checkPipeline = redis.Pipeline{}
+		}
+		checkPipeline = this.client.PipeAppend(checkPipeline, &res, "SISMEMBER",
+			this.prefix+"allowlist:"+key, value)
+	}
+	if checkPipeline != nil {
+		if err := this.client.PipeDo(ctx, checkPipeline); err != nil {
+			// Same policy as a decay-pipeline failure: surface it rather than
+			// silently treating everyone as allowlisted or as not allowlisted.
+			panic(redis.RedisError(err.Error()))
+		}
+	}
+	ipAllowed := membership["rl_ip"] != nil && *membership["rl_ip"] == 1
+	for i, descriptor := range request.Descriptors {
+		if limits[i] == nil {
+			continue
+		}
+		for _, entry := range descriptor.Entries {
+			switch entry.Key {
+			case "rl_ip":
+				allowlisted[i] = ipAllowed
+			case "rl_ua":
+				allowlisted[i] = ipAllowed || (membership["rl_ua"] != nil && *membership["rl_ua"] == 1)
+			case "rl_subject":
+				allowlisted[i] = ipAllowed || (membership["rl_subject"] != nil && *membership["rl_subject"] == 1)
+			}
+		}
+	}
+
+	var pipeline redis.Pipeline
+
 	for i, descriptor := range request.Descriptors {
 		statuses[i] = &pb.RateLimitResponse_DescriptorStatus{Code: pb.RateLimitResponse_OK, LimitRemaining: math.MaxUint32}
-		if limits[i] == nil {
+		if limits[i] == nil || allowlisted[i] {
 			continue
 		}
 		// Key without a window timestamp — the decaying value itself carries time.
@@ -113,7 +185,7 @@ func (this *decayRateLimitCacheImpl) DoLimit(
 	}
 
 	for i := range request.Descriptors {
-		if limits[i] == nil {
+		if limits[i] == nil || allowlisted[i] {
 			continue
 		}
 		limit := uint64(limits[i].Limit.RequestsPerUnit)
